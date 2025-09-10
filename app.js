@@ -1,8 +1,9 @@
-// app.js - Updated version with better error handling and reliability
+// app.js — JSON API backend for albums/media with robust Puppeteer + proper Express ordering
 const express = require('express');
 const puppeteer = require('puppeteer');
 const { URL } = require('url');
 
+// ----- Puppeteer config -----
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome';
 const CHROME_ARGS = [
   '--no-sandbox',
@@ -10,119 +11,110 @@ const CHROME_ARGS = [
   '--disable-dev-shm-usage',
   '--disable-gpu',
   '--no-zygote',
-  '--single-process',
-  '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+  '--single-process'
 ];
 
-// Enhanced launch helper with better configuration
 async function launchBrowser() {
   return puppeteer.launch({
-    headless: 'new',
+    headless: true,
     executablePath: CHROME_PATH,
     args: CHROME_ARGS,
     timeout: 60000
   });
 }
 
-// Add request interception to block unnecessary resources
 async function setupPage(page) {
+  // Lightweight interception: skip fonts to save time, keep images (thumbnails needed)
   await page.setRequestInterception(true);
-  page.on('request', (request) => {
-    const resourceType = request.resourceType();
-    // Block images, fonts, and media on initial load to speed things up
-    if (['image', 'font', 'media'].includes(resourceType)) {
-      request.abort();
-    } else {
-      request.continue();
-    }
+  page.on('request', (req) => {
+    const rt = req.resourceType();
+    if (rt === 'font') req.abort();
+    else req.continue();
   });
-  
-  await page.setViewport({ width: 1280, height: 800 });
+
+  await page.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36'
+  );
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+  await page.setViewport({ width: 1280, height: 900 });
   return page;
 }
 
-// Scrape a specific album page with improved reliability
+// ----- Scrapers -----
+async function scrapeHotPicAll() {
+  const browser = await launchBrowser();
+  try {
+    const page = await browser.newPage();
+    await setupPage(page);
+
+    await page.goto('https://hotpic.one/nsfw/', { waitUntil: 'domcontentloaded', timeout: 120000 });
+
+    const anchorSelector =
+      'a[data-zoom="false"][data-autofit="false"][data-preload="true"][data-download="true"][data-controls="false"][href^="/album/"]';
+
+    await page.waitForSelector(anchorSelector, { timeout: 60000 });
+
+    const items = await page.evaluate((sel) => {
+      const anchors = Array.from(document.querySelectorAll(sel));
+      const origin = location.origin;
+      const absolutize = (url) => {
+        try { return new URL(url, origin).toString(); } catch { return url || ''; }
+      };
+
+      return anchors.map(a => {
+        const hrefRaw = a.getAttribute('href') || '';
+        const hrefAbs = absolutize(hrefRaw);
+
+        const img = a.querySelector('img.img-fluid') || a.querySelector('img');
+        const thumbRaw = img ? (img.getAttribute('data-src') || img.getAttribute('src') || '') : '';
+        const thumb = absolutize(thumbRaw);
+
+        const title = a.getAttribute('data-title') || a.getAttribute('title') || (img ? img.getAttribute('alt') : '') || '';
+
+        return { href: hrefAbs, thumb, title };
+      }).filter(x => x.href);
+    }, anchorSelector);
+
+    if (!items || items.length === 0) throw new Error('No album anchors found');
+    return items;
+  } finally {
+    await browser.close();
+  }
+}
+
 async function scrapeAlbum(url) {
   let browser;
   try {
     browser = await launchBrowser();
     const page = await browser.newPage();
-    
-    // Set up request interception
     await setupPage(page);
-    
-    // Set a reasonable timeout
-    await page.setDefaultNavigationTimeout(60000);
-    
-    console.log(`Navigating to: ${url}`);
-    await page.goto(url, { 
-      waitUntil: 'domcontentloaded',
-      timeout: 60000
-    });
 
-    // Wait for the main content with a more flexible approach
+    await page.setDefaultNavigationTimeout(60000);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    const primarySel = '.hotgrid .hotplay a.spotlight';
     try {
-      await page.waitForSelector('.hotgrid, .hotplay, a.spotlight', { 
-        timeout: 30000 
+      await page.waitForSelector(primarySel, { timeout: 60000, visible: true });
+    } catch {
+      // Scroll to trigger lazy loads, then retry
+      await page.evaluate(async () => {
+        await new Promise((resolve) => {
+          let y = 0;
+          const step = () => {
+            y += 900;
+            window.scrollTo(0, y);
+            if (y < document.body.scrollHeight + 1200) setTimeout(step, 150);
+            else setTimeout(resolve, 500);
+          };
+          step();
+        });
       });
-    } catch (e) {
-      console.log('Primary selectors not found, trying fallback...');
-      // Fallback: check if page loaded at all
-      await page.waitForSelector('body', { timeout: 10000 });
+      await page.waitForSelector(primarySel, { timeout: 30000 });
     }
 
-    // More efficient scrolling with better detection of content
-    await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        let totalHeight = 0;
-        const distance = 500;
-        const timer = setInterval(() => {
-          const scrollHeight = document.body.scrollHeight;
-          window.scrollBy(0, distance);
-          totalHeight += distance;
-          
-          if (totalHeight >= scrollHeight || totalHeight > 5000) {
-            clearInterval(timer);
-            setTimeout(resolve, 1000);
-          }
-        }, 200);
-      });
-    });
-
-    // Try multiple selector strategies
     const mediaItems = await page.evaluate(() => {
-      const absolutize = (u) => { 
-        try { 
-          return new URL(u, location.origin).toString(); 
-        } catch { 
-          return u || ''; 
-        } 
-      };
-      
-      // Try multiple selector patterns
-      const selectors = [
-        '.hotgrid .hotplay a.spotlight',
-        'a[data-media]',
-        '.hotgrid a',
-        'a.spotlight'
-      ];
-      
-      let anchors = [];
-      for (const selector of selectors) {
-        const elements = document.querySelectorAll(selector);
-        if (elements.length > 0) {
-          anchors = Array.from(elements);
-          break;
-        }
-      }
-      
-      if (anchors.length === 0) {
-        // Last resort: find any media links
-        anchors = Array.from(document.querySelectorAll('a')).filter(a => {
-          const href = a.getAttribute('href') || '';
-          return /\.(jpg|jpeg|png|gif|webp|mp4|webm|avi)$/i.test(href);
-        });
-      }
+      const absolutize = (u) => { try { return new URL(u, location.origin).toString(); } catch { return u || ''; } };
+      const anchors = Array.from(document.querySelectorAll('.hotgrid .hotplay a.spotlight'));
 
       return anchors.map(a => {
         const mediaType = (a.getAttribute('data-media') || '').toLowerCase();
@@ -134,113 +126,84 @@ async function scrapeAlbum(url) {
         const posterAttr = a.getAttribute('data-poster') || '';
         const poster = absolutize(posterAttr);
 
-        // Video detection
-        const isVideo = mediaType === 'video' || 
-                       /\.mp4(\?|$)/i.test(srcMp4Attr) || 
-                       /\.mp4(\?|$)/i.test(hrefAttr) ||
-                       srcMp4Attr.length > 0;
-        
-        if (isVideo) {
-          return { 
-            kind: 'video', 
-            src: srcMp4 || href, 
-            poster: poster || '', 
-            title 
-          };
-        }
+        // Video
+        const isVideo = mediaType === 'video' || /\.mp4(\?|$)/i.test(srcMp4Attr) || /\.mp4(\?|$)/i.test(hrefAttr);
+        if (isVideo) return { kind: 'video', src: srcMp4 || href, poster: poster || '', title };
 
-        // Image detection
+        // Image
         const dataSrcAttr = a.getAttribute('data-src') || '';
         let imgSrc = dataSrcAttr ? absolutize(dataSrcAttr) : '';
 
         if (!imgSrc) {
           const img = a.querySelector('img');
-          if (img) {
-            imgSrc = absolutize(img.getAttribute('data-src') || img.currentSrc || img.src || '');
-          }
+          if (img) imgSrc = absolutize(img.getAttribute('data-src') || img.currentSrc || img.src || '');
         }
-
         if (!imgSrc && href && /\.(webp|avif|jpg|jpeg|png|gif|bmp)(\?|$)/i.test(hrefAttr)) {
           imgSrc = href;
         }
-
         if (!imgSrc) {
           const bg = (getComputedStyle(a).getPropertyValue('background-image') || '').trim();
           const m = bg.match(/url\(["']?(.*?)["']?\)/i);
-          if (m && m[1]) imgSrc = absolutize(m[1]);
+          if (m && m[15]) imgSrc = absolutize(m[15]);
         }
-
         return imgSrc ? { kind: 'image', src: imgSrc, poster: '', title } : null;
       }).filter(Boolean);
     });
 
     // Deduplicate
     const seen = new Set();
-    const uniqueItems = mediaItems.filter(it => {
+    return mediaItems.filter(it => {
       const key = `${it.kind}:${it.src}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-
-    console.log(`Found ${uniqueItems.length} media items`);
-    return uniqueItems;
-    
-  } catch (error) {
-    console.error('Album scraping error:', error);
-    throw new Error(`Failed to scrape album: ${error.message}`);
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    if (browser) await browser.close();
   }
 }
 
-// Add error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).send(`
-    <!doctype html>
-    <html>
-    <head><title>Error</title></head>
-    <body>
-      <h1>Something went wrong</h1>
-      <p>${error.message}</p>
-      <a href="/">Go back to homepage</a>
-    </body>
-    </html>
-  `);
-});
+// ----- Express app (order matters) -----
+const app = express();
 
-// Update your album route with better error handling
-app.get('/album', async (req, res, next) => {
-  const albumUrl = req.query.u;
-  if (!albumUrl) {
-    return res.status(400).send('Missing album URL');
-  }
-
-  try {
-    // Validate URL
-    new URL(albumUrl);
-    
-    const mediaItems = await scrapeAlbum(albumUrl);
-    
-    if (mediaItems.length === 0) {
-      return res.status(404).send('No media items found in this album');
-    }
-
-    // Rest of your rendering code remains the same...
-    // [Keep your existing HTML rendering code here]
-    
-  } catch (error) {
-    next(error); // Pass to error handling middleware
-  }
-});
-
-// Add a timeout middleware
+// Optional: per-request timeouts early in stack
 app.use((req, res, next) => {
-  req.setTimeout(120000, () => {
-    res.status(504).send('Request timeout');
-  });
+  req.setTimeout?.(120000);
+  res.setTimeout?.(120000);
   next();
 });
+
+// Health
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// JSON APIs
+app.get('/api/home', async (_req, res, next) => {
+  try {
+    const items = await scrapeHotPicAll();
+    res.json({ count: items.length, items });
+  } catch (e) { next(e); }
+});
+
+app.get('/api/album', async (req, res, next) => {
+  try {
+    const albumUrl = req.query.u;
+    if (!albumUrl) return res.status(400).json({ error: 'MISSING_URL' });
+    new URL(albumUrl); // validate
+    const items = await scrapeAlbum(albumUrl);
+    if (items.length === 0) return res.status(404).json({ error: 'NO_MEDIA' });
+    res.json({ count: items.length, items });
+  } catch (e) { next(e); }
+});
+
+// 404 last-but-one
+app.use((_req, res) => res.status(404).json({ error: 'NOT_FOUND' }));
+
+// Error handler LAST
+app.use((err, req, res, _next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'INTERNAL', message: String(err.message || err) });
+});
+
+// Listen
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Listening on http://localhost:${PORT}`));
