@@ -2,11 +2,27 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 
-async function scrapeHotPicAll() {
-  const browser = await puppeteer.launch({
+const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome';
+const CHROME_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--no-zygote',
+  '--single-process'
+];
+
+// Launch helper so flags stay consistent
+async function launchBrowser() {
+  return puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox']
+    executablePath: CHROME_PATH,
+    args: CHROME_ARGS
   });
+}
+
+async function scrapeHotPicAll() {
+  const browser = await launchBrowser();
   const page = await browser.newPage();
 
   await page.goto('https://hotpic.one/nsfw/', {
@@ -50,10 +66,7 @@ async function scrapeHotPicAll() {
 
 // Scrape a specific album page for media items from .hotgrid .hotplay a.spotlight
 async function scrapeAlbum(url) {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox']
-  });
+  const browser = await launchBrowser();
   const page = await browser.newPage();
 
   // Big viewport + scroll to trigger lazy-load thumbnails
@@ -99,14 +112,13 @@ async function scrapeAlbum(url) {
         return { kind: 'video', src: srcMp4 || href, poster: poster || '', title };
       }
 
-      // Image branch: prefer explicit data-src, else inner <img> (currentSrc/src), else href if it looks like an image, else CSS background-image
+      // Image branch
       const dataSrcAttr = a.getAttribute('data-src') || '';
       let imgSrc = dataSrcAttr ? absolutize(dataSrcAttr) : '';
 
       if (!imgSrc) {
         const img = a.querySelector('img');
         if (img) {
-          // currentSrc reflects the selected candidate after lazy-loading; fallback to src or data-src
           imgSrc = absolutize(img.getAttribute('data-src') || img.currentSrc || img.src || '');
         }
       }
@@ -117,8 +129,8 @@ async function scrapeAlbum(url) {
 
       if (!imgSrc) {
         const bg = (getComputedStyle(a).getPropertyValue('background-image') || '').trim();
-        const m = bg.match(/url\\(["']?(.*?)["']?\\)/i);
-        if (m && m[21]) imgSrc = absolutize(m[21]);
+        const m = bg.match(/url\(["']?(.*?)["']?\)/i);
+        if (m && m[22]) imgSrc = absolutize(m[22]);
       }
 
       return imgSrc ? { kind: 'image', src: imgSrc, poster: '', title } : null;
@@ -141,6 +153,9 @@ async function scrapeAlbum(url) {
   const items = await scrapeHotPicAll();
 
   const app = express();
+
+  // Simple health check for Render or any uptime monitor
+  app.get('/health', (_req, res) => res.send('ok'));
 
   app.get('/', (req, res) => {
     const tiles = items.map(({ href, thumb, title }) => {
@@ -245,9 +260,9 @@ async function scrapeAlbum(url) {
 
         // Attempt sibling extension fallbacks when URL ends with .webp
         let jpg = null, png = null;
-        if (/\\.webp(\\?|$)/i.test(url)) {
-          jpg = url.replace(/\\.webp(\\?|$)/i, '.jpg$1');
-          png = url.replace(/\\.webp(\\?|$)/i, '.png$1');
+        if (/\.webp(\?|$)/i.test(url)) {
+          jpg = url.replace(/\.webp(\?|$)/i, '.jpg$1');
+          png = url.replace(/\.webp(\?|$)/i, '.png$1');
         }
 
         return `
@@ -320,7 +335,12 @@ async function scrapeAlbum(url) {
   });
 
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log(`http://localhost:${PORT}`));
+  const appInstance = app.listen(PORT, () => console.log(`http://localhost:${PORT}`));
+
+  // Graceful shutdown (optional good practice)
+  process.on('SIGTERM', () => {
+    appInstance.close(() => process.exit(0));
+  });
 })().catch(err => {
   console.error('Startup failed:', err);
   process.exit(1);
