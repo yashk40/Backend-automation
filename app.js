@@ -73,7 +73,7 @@ async function scrapeAlbum(url) {
   await page.setViewport({ width: 1280, height: 2200 });
   await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
 
-  await page.waitForSelector('.hotgrid .hotplay a.spotlight', { timeout: 30000 });
+  await page.waitForSelector('.hotgrid .hotplay a.spotlight', { timeout: 300000 });
 
   // Scroll through the page to ensure lazy images load
   await page.evaluate(async () => {
