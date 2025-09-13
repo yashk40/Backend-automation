@@ -41,13 +41,14 @@ async function setupPage(page) {
 }
 
 // ----- Scrapers -----
-async function scrapeHotPicAll() {
+async function scrapeHotPicAll(pageNum = 1) {
   const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
     await setupPage(page);
 
-    await page.goto('https://hotpic.one/nsfw/', { waitUntil: 'domcontentloaded', timeout: 120000 });
+    const url = pageNum === 1 ? 'https://hotpic.one/nsfw/' : `https://hotpic.one/nsfw/${pageNum}`;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
 
     const anchorSelector =
       'a[data-zoom="false"][data-autofit="false"][data-preload="true"][data-download="true"][data-controls="false"][href^="/album/"]';
@@ -177,10 +178,11 @@ app.use((req, res, next) => {
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // JSON APIs
-app.get('/api/home', async (_req, res, next) => {
+app.get('/api/home', async (req, res, next) => {
   try {
-    const items = await scrapeHotPicAll();
-    res.json({ count: items.length, items });
+    const pageNum = parseInt(req.query.page) || 1;
+    const items = await scrapeHotPicAll(pageNum);
+    res.json({ count: items.length, items, page: pageNum });
   } catch (e) { next(e); }
 });
 
