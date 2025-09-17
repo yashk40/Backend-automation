@@ -93,32 +93,11 @@ async function scrapeAlbum(url) {
     await page.setDefaultNavigationTimeout(60000);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Be resilient: wait for any one of multiple possible selectors that represent media anchors
-    const candidateSelectors = [
-      '.hotgrid .hotplay a.spotlight',
-      '.hotgrid a[data-media]',
-      '.hotgrid a[data-src]',
-      'a.spotlight[data-media]',
-      'a.spotlight'
-    ];
-
-    async function waitForAnySelector(page, selectors, timeoutMs) {
-      const start = Date.now();
-      for (;;) {
-        for (const sel of selectors) {
-          const found = await page.$(sel);
-          if (found) return sel;
-        }
-        if (Date.now() - start > timeoutMs) throw new Error('Media anchors not found');
-        await page.waitForTimeout(300);
-      }
-    }
-
-    let matchedSelector;
+    const primarySel = '.hotgrid .hotplay a.spotlight';
     try {
-      matchedSelector = await waitForAnySelector(page, candidateSelectors, 15000);
+      await page.waitForSelector(primarySel, { timeout: 60000, visible: true });
     } catch {
-      // Scroll to trigger lazy loads, then retry broader wait
+      // Scroll to trigger lazy loads, then retry
       await page.evaluate(async () => {
         await new Promise((resolve) => {
           let y = 0;
@@ -131,21 +110,12 @@ async function scrapeAlbum(url) {
           step();
         });
       });
-      matchedSelector = await waitForAnySelector(page, candidateSelectors, 30000);
+      await page.waitForSelector(primarySel, { timeout: 30000 });
     }
 
     const mediaItems = await page.evaluate(() => {
       const absolutize = (u) => { try { return new URL(u, location.origin).toString(); } catch { return u || ''; } };
-      const selectors = [
-        '.hotgrid .hotplay a.spotlight',
-        '.hotgrid a[data-media]',
-        '.hotgrid a[data-src]',
-        'a.spotlight[data-media]',
-        'a.spotlight'
-      ];
-      const anchors = Array.from(new Set(
-        selectors.flatMap(sel => Array.from(document.querySelectorAll(sel)))
-      ));
+      const anchors = Array.from(document.querySelectorAll('.hotgrid .hotplay a.spotlight'));
 
       return anchors.map(a => {
         const mediaType = (a.getAttribute('data-media') || '').toLowerCase();
@@ -175,7 +145,7 @@ async function scrapeAlbum(url) {
         if (!imgSrc) {
           const bg = (getComputedStyle(a).getPropertyValue('background-image') || '').trim();
           const m = bg.match(/url\(["']?(.*?)["']?\)/i);
-          if (m && m[1]) imgSrc = absolutize(m[1]);
+          if (m && m[15]) imgSrc = absolutize(m[15]);
         }
         return imgSrc ? { kind: 'image', src: imgSrc, poster: '', title } : null;
       }).filter(Boolean);
