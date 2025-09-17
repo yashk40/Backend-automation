@@ -17,6 +17,7 @@
     "express": "^5.1.0",
     "multer": "^2.0.2",
     "node-telegram-bot-api": "^0.66.0",
+    "proxifly": "^2.0.2",
     "puppeteer": "^24.20.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
