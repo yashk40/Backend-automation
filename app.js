@@ -1,7 +1,30 @@
-// app.js — JSON API backend for albums/media with robust Puppeteer + proper Express ordering
+// app.js — Optimized JSON API backend for albums/media with Puppeteer + Express
 const express = require('express');
 const puppeteer = require('puppeteer');
 const { URL } = require('url');
+
+// ----- Lightweight LRU Cache -----
+class LRUCache {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.cache = new Map();
+  }
+  get(key) {
+    if (!this.cache.has(key)) return null;
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    return value;
+  }
+  set(key, value) {
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+    this.cache.set(key, value);
+  }
+}
+const cache = new LRUCache(10); // Small cache to fit in 200 MB
 
 // ----- Puppeteer config -----
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome';
@@ -11,166 +34,184 @@ const CHROME_ARGS = [
   '--disable-dev-shm-usage',
   '--disable-gpu',
   '--no-zygote',
-  '--single-process'
+  '--single-process',
+  '--disable-background-networking',
+  '--disable-extensions',
+  '--disable-sync',
+  '--disable-translate',
+  '--no-first-run',
+  '--disable-background-timer-throttling',
+  '--disable-client-side-phishing-detection',
+  '--disable-default-apps',
+  '--disable-hang-monitor',
+  '--disable-prompt-on-repost',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--disable-ipc-flooding-protection',
+  '--enable-low-end-device-mode',
+  '--js-flags=--expose-gc' // Enable manual GC
 ];
 
-async function launchBrowser() {
-  return puppeteer.launch({
-    headless: true,
-    executablePath: CHROME_PATH,
-    args: CHROME_ARGS,
-    timeout: 60000
+let browser = null;
+async function getBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: CHROME_PATH,
+      args: CHROME_ARGS,
+      timeout: 30000,
+      protocolTimeout: 30000
+    });
+    browser.on('disconnected', () => { browser = null; });
+  }
+  return browser;
+}
+
+// Simple queue to limit concurrent pages
+const pageQueue = [];
+let activePages = 0;
+const MAX_PAGES = 1;
+
+async function withPage(fn) {
+  return new Promise((resolve, reject) => {
+    pageQueue.push({ fn, resolve, reject });
+    processQueue();
   });
 }
 
-async function setupPage(page) {
-  // Lightweight interception: skip fonts to save time, keep images (thumbnails needed)
+async function processQueue() {
+  if (activePages >= MAX_PAGES || pageQueue.length === 0) return;
+  activePages++;
+  const { fn, resolve, reject } = pageQueue.shift();
+  try {
+    const result = await fn();
+    resolve(result);
+  } catch (e) {
+    reject(e);
+  } finally {
+    activePages--;
+    processQueue();
+    if (global.gc) global.gc(); // Trigger GC if available
+  }
+}
+
+async function setupPage(page, disableImages = false) {
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const rt = req.resourceType();
-    if (rt === 'font') req.abort();
+    if (rt === 'font' || (disableImages && rt === 'image')) req.abort();
     else req.continue();
   });
-
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36'
-  );
-  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-  await page.setViewport({ width: 1280, height: 900 });
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123');
+  await page.setViewport({ width: 800, height: 600 }); // Smaller viewport
   return page;
 }
 
 // ----- Scrapers -----
 async function scrapeHotPicAll(pageNum = 1) {
-  const browser = await launchBrowser();
-  try {
+  const cacheKey = `home:${pageNum}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  return withPage(async () => {
+    const browser = await getBrowser();
     const page = await browser.newPage();
-    await setupPage(page);
+    try {
+      await setupPage(page, false); // Keep images for thumbnails
+      const url = pageNum === 1 ? 'https://hotpic.one/nsfw/' : `https://hotpic.one/nsfw/${pageNum}`;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    const url = pageNum === 1 ? 'https://hotpic.one/nsfw/' : `https://hotpic.one/nsfw/${pageNum}`;
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      const anchorSelector = 'a[data-zoom="false"][href^="/album/"]';
+      await page.waitForSelector(anchorSelector, { timeout: 30000 });
 
-    const anchorSelector =
-      'a[data-zoom="false"][data-autofit="false"][data-preload="true"][data-download="true"][data-controls="false"][href^="/album/"]';
+      const items = await page.evaluate((sel) => {
+        const anchors = Array.from(document.querySelectorAll(sel));
+        const origin = location.origin;
+        const absolutize = (url) => {
+          try { return new URL(url, origin).toString(); } catch { return url || ''; }
+        };
+        return anchors.map(a => {
+          const href = absolutize(a.getAttribute('href') || '');
+          const img = a.querySelector('img');
+          const thumb = img ? absolutize(img.getAttribute('data-src') || img.getAttribute('src') || '') : '';
+          const title = a.getAttribute('data-title') || a.getAttribute('title') || (img ? img.getAttribute('alt') : '') || '';
+          return { href, thumb, title };
+        }).filter(x => x.href);
+      }, anchorSelector);
 
-    await page.waitForSelector(anchorSelector, { timeout: 60000 });
-
-    const items = await page.evaluate((sel) => {
-      const anchors = Array.from(document.querySelectorAll(sel));
-      const origin = location.origin;
-      const absolutize = (url) => {
-        try { return new URL(url, origin).toString(); } catch { return url || ''; }
-      };
-
-      return anchors.map(a => {
-        const hrefRaw = a.getAttribute('href') || '';
-        const hrefAbs = absolutize(hrefRaw);
-
-        const img = a.querySelector('img.img-fluid') || a.querySelector('img');
-        const thumbRaw = img ? (img.getAttribute('data-src') || img.getAttribute('src') || '') : '';
-        const thumb = absolutize(thumbRaw);
-
-        const title = a.getAttribute('data-title') || a.getAttribute('title') || (img ? img.getAttribute('alt') : '') || '';
-
-        return { href: hrefAbs, thumb, title };
-      }).filter(x => x.href);
-    }, anchorSelector);
-
-    if (!items || items.length === 0) throw new Error('No album anchors found');
-    return items;
-  } finally {
-    await browser.close();
-  }
+      if (!items.length) throw new Error('No album anchors found');
+      cache.set(cacheKey, items);
+      return items;
+    } finally {
+      await page.close();
+    }
+  });
 }
 
 async function scrapeAlbum(url) {
-  let browser;
-  try {
-    browser = await launchBrowser();
+  const cacheKey = `album:${url}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  return withPage(async () => {
+    const browser = await getBrowser();
     const page = await browser.newPage();
-    await setupPage(page);
-
-    await page.setDefaultNavigationTimeout(60000);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    const primarySel = '.hotgrid .hotplay a.spotlight';
     try {
-      await page.waitForSelector(primarySel, { timeout: 60000, visible: true });
-    } catch {
-      // Scroll to trigger lazy loads, then retry
-      await page.evaluate(async () => {
-        await new Promise((resolve) => {
-          let y = 0;
-          const step = () => {
-            y += 900;
-            window.scrollTo(0, y);
-            if (y < document.body.scrollHeight + 1200) setTimeout(step, 150);
-            else setTimeout(resolve, 500);
-          };
-          step();
+      await setupPage(page, true); // Disable images to save memory
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      const primarySel = '.hotgrid .hotplay a.spotlight';
+      try {
+        await page.waitForSelector(primarySel, { timeout: 15000 });
+      } catch {
+        await page.evaluate(() => {
+          window.scrollTo(0, document.body.scrollHeight);
         });
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await page.waitForSelector(primarySel, { timeout: 15000 });
+      }
+
+      const mediaItems = await page.evaluate(() => {
+        const absolutize = (u) => { try { return new URL(u, location.origin).toString(); } catch { return u || ''; } };
+        const anchors = Array.from(document.querySelectorAll('.hotgrid .hotplay a.spotlight'));
+        return anchors.map(a => {
+          const mediaType = (a.getAttribute('data-media') || '').toLowerCase();
+          const title = a.getAttribute('title') || a.getAttribute('data-title') || '';
+          const href = absolutize(a.getAttribute('href') || '');
+          const srcMp4 = absolutize(a.getAttribute('data-src-mp4') || '');
+          const poster = absolutize(a.getAttribute('data-poster') || '');
+          const isVideo = mediaType === 'video' || /\.mp4(\?|$)/i.test(srcMp4) || /\.mp4(\?|$)/i.test(href);
+          if (isVideo) return { kind: 'video', src: srcMp4 || href, poster, title };
+          const dataSrc = absolutize(a.getAttribute('data-src') || '');
+          if (dataSrc && /\.(webp|avif|jpg|jpeg|png|gif|bmp)(\?|$)/i.test(dataSrc)) {
+            return { kind: 'image', src: dataSrc, poster: '', title };
+          }
+          return null;
+        }).filter(Boolean);
       });
-      await page.waitForSelector(primarySel, { timeout: 30000 });
+
+      const seen = new Set();
+      const deduped = mediaItems.filter(it => {
+        const key = `${it.kind}:${it.src}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      if (!deduped.length) throw new Error('No media found');
+      cache.set(cacheKey, deduped);
+      return deduped;
+    } finally {
+      await page.close();
     }
-
-    const mediaItems = await page.evaluate(() => {
-      const absolutize = (u) => { try { return new URL(u, location.origin).toString(); } catch { return u || ''; } };
-      const anchors = Array.from(document.querySelectorAll('.hotgrid .hotplay a.spotlight'));
-
-      return anchors.map(a => {
-        const mediaType = (a.getAttribute('data-media') || '').toLowerCase();
-        const title = a.getAttribute('title') || a.getAttribute('data-title') || '';
-        const hrefAttr = a.getAttribute('href') || '';
-        const href = absolutize(hrefAttr);
-        const srcMp4Attr = a.getAttribute('data-src-mp4') || '';
-        const srcMp4 = absolutize(srcMp4Attr);
-        const posterAttr = a.getAttribute('data-poster') || '';
-        const poster = absolutize(posterAttr);
-
-        // Video
-        const isVideo = mediaType === 'video' || /\.mp4(\?|$)/i.test(srcMp4Attr) || /\.mp4(\?|$)/i.test(hrefAttr);
-        if (isVideo) return { kind: 'video', src: srcMp4 || href, poster: poster || '', title };
-
-        // Image
-        const dataSrcAttr = a.getAttribute('data-src') || '';
-        let imgSrc = dataSrcAttr ? absolutize(dataSrcAttr) : '';
-
-        if (!imgSrc) {
-          const img = a.querySelector('img');
-          if (img) imgSrc = absolutize(img.getAttribute('data-src') || img.currentSrc || img.src || '');
-        }
-        if (!imgSrc && href && /\.(webp|avif|jpg|jpeg|png|gif|bmp)(\?|$)/i.test(hrefAttr)) {
-          imgSrc = href;
-        }
-        if (!imgSrc) {
-          const bg = (getComputedStyle(a).getPropertyValue('background-image') || '').trim();
-          const m = bg.match(/url\(["']?(.*?)["']?\)/i);
-          if (m && m[15]) imgSrc = absolutize(m[15]);
-        }
-        return imgSrc ? { kind: 'image', src: imgSrc, poster: '', title } : null;
-      }).filter(Boolean);
-    });
-
-    // Deduplicate
-    const seen = new Set();
-    return mediaItems.filter(it => {
-      const key = `${it.kind}:${it.src}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  } finally {
-    if (browser) await browser.close();
-  }
+  });
 }
 
-// ----- Express app (order matters) -----
+// ----- Express app -----
 const app = express();
-
-// Optional: per-request timeouts early in stack
+app.set('etag', false); // Disable ETag to save memory
 app.use((req, res, next) => {
-  req.setTimeout?.(120000);
-  res.setTimeout?.(120000);
+  res.setTimeout(60000);
   next();
 });
 
@@ -190,20 +231,25 @@ app.get('/api/album', async (req, res, next) => {
   try {
     const albumUrl = req.query.u;
     if (!albumUrl) return res.status(400).json({ error: 'MISSING_URL' });
-    new URL(albumUrl); // validate
+    new URL(albumUrl);
     const items = await scrapeAlbum(albumUrl);
-    if (items.length === 0) return res.status(404).json({ error: 'NO_MEDIA' });
     res.json({ count: items.length, items });
   } catch (e) { next(e); }
 });
 
-// 404 last-but-one
+// 404
 app.use((_req, res) => res.status(404).json({ error: 'NOT_FOUND' }));
 
-// Error handler LAST
-app.use((err, req, res, _next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'INTERNAL', message: String(err.message || err) });
+// Error handler
+app.use((err, _req, res, _next) => {
+  console.error('Error:', err.message);
+  res.status(500).json({ error: 'INTERNAL', message: err.message });
+});
+
+// Clean up browser on exit
+process.on('SIGTERM', async () => {
+  if (browser) await browser.close();
+  process.exit(0);
 });
 
 // Listen
