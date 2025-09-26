@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const MAX_PAGES = Math.max(1, Math.min(4, Number(process.env.MAX_PAGES) || Math.max(1, Math.min(4, os.cpus().length))));
 const QUEUE_LIMIT = Number(process.env.QUEUE_LIMIT || 50); // backpressure
 const LAUNCH_TIMEOUT_MS = Number(process.env.LAUNCH_TIMEOUT_MS || 0); // 0 = disable to avoid WS race on cold boot
-const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 60000);
+const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 90000);
 const REQ_BUDGET_MS = Number(process.env.REQ_BUDGET_MS || 90000);
 
 // Prefer bundled Chromium; set PUPPETEER_EXECUTABLE_PATH to force system Chrome if needed
